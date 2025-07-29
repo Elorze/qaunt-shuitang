@@ -1,0 +1,425 @@
+import numpy as np
+import pandas as pd
+import datetime, os, time
+import multiprocessing as mp
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import StandardScaler  # 新增：用于因子标准化
+from sklearn.model_selection import TimeSeriesSplit  # 新增：用于时间序列交叉验证
+import xgboost as xgb
+
+class OlsModel:
+    def __init__(self):
+        # --------------------------
+        # 1. Kaggle数据路径调整
+        # --------------------------
+        self.train_data_path = "/kaggle/input/avenir-hku-web/kline_data/train_data"  # Kaggle训练数据文件夹路径（需替换为实际路径）
+        self.submission_id_path = "/kaggle/input/avenir-hku-web/submission_id.csv"  # 提交ID文件路径
+        self.start_datetime = datetime.datetime(2021, 3, 1, 0, 0, 0)
+        self.all_train_data = []  # 新增：用于全局分数统计
+    
+    def get_all_symbol_list(self):
+        try:
+            print(f"[get_all_symbol_list] 正在检查路径: {self.train_data_path}")
+            if not os.path.exists(self.train_data_path):
+                print(f"[get_all_symbol_list] 错误：路径不存在: {self.train_data_path}")
+                return []
+                
+            parquet_name_list = os.listdir(self.train_data_path)
+            print(f"[get_all_symbol_list] 找到文件数量: {len(parquet_name_list)}")
+            
+            symbol_list = [parquet_name.split(".")[0] for parquet_name in parquet_name_list if parquet_name.endswith(".parquet")]
+            print(f"[get_all_symbol_list] 有效币种数量: {len(symbol_list)}")
+            if len(symbol_list) > 0:
+                print(f"[get_all_symbol_list] 前5个币种: {symbol_list[:5]}")
+            return symbol_list
+        except Exception as e:
+            print(f"get_all_symbol_list error: {e}")
+            return []
+    
+    def get_single_symbol_kline_data(self, symbol):
+        try:
+            print(f"[get_single_symbol_kline_data] 开始读取: {symbol}")
+            df = pd.read_parquet(f"{self.train_data_path}/{symbol}.parquet")
+            df = df.set_index("timestamp")
+            df = df.astype(np.float64)
+            # 处理volume为0的情况（避免除零错误）
+            df['vwap'] = np.where(df['volume'] == 0, np.nan, df['amount'] / df['volume'])
+            df['vwap'] = df['vwap'].replace([np.inf, -np.inf], np.nan).ffill()
+            df.columns.name = symbol  # 标记列所属符号，便于后续合并
+            print(f"[get_single_symbol_kline_data] 成功读取: {symbol}, 数据形状: {df.shape}")
+            return df
+        except Exception as e:
+            print(f"get_single_symbol_kline_data error (symbol: {symbol}): {e}")
+            return pd.DataFrame()
+    
+    def get_all_symbol_kline(self):
+        t0 = datetime.datetime.now()
+        print(f"[get_all_symbol_kline] 开始读取币种数据...")
+        
+        all_symbol_list = self.get_all_symbol_list()
+        print(f"[get_all_symbol_kline] 找到币种数量: {len(all_symbol_list)}")
+        
+        if not all_symbol_list:
+            print("No symbols found in train_data_path.")
+            return [], [], [], [], [], [], [], []
+        
+        df_list = []
+        for idx, symbol in enumerate(all_symbol_list):
+            print(f"[get_all_symbol_kline] 正在读取第{idx+1}/{len(all_symbol_list)}个币种: {symbol}")
+            df = self.get_single_symbol_kline_data(symbol)
+            df_list.append(df)
+            if (idx+1) % 10 == 0:  # 每10个币种打印一次进度
+                print(f"[get_all_symbol_kline] 已读取 {idx+1}/{len(all_symbol_list)} 个币种")
+        
+        print(f"[get_all_symbol_kline] 所有币种读取完成，开始数据拼接...")
+        print(f"[get_all_symbol_kline] 数据拼接完成, 用时: {datetime.datetime.now() - t0}")
+        # 分别拼接每个字段，列名为symbol
+        df_open_price = pd.concat([df['open_price'] for df in df_list], axis=1)
+        df_high_price = pd.concat([df['high_price'] for df in df_list], axis=1)
+        df_low_price = pd.concat([df['low_price'] for df in df_list], axis=1)
+        df_close_price = pd.concat([df['close_price'] for df in df_list], axis=1)
+        df_vwap = pd.concat([df['vwap'] for df in df_list], axis=1)
+        df_amount = pd.concat([df['amount'] for df in df_list], axis=1)
+        df_open_price = df_open_price.sort_index(ascending=True)
+        time_arr = pd.to_datetime(df_open_price.index, unit='ms').values
+        open_price_arr = df_open_price.values.astype(float)
+        high_price_arr = df_high_price.sort_index(ascending=True).values.astype(float)
+        low_price_arr = df_low_price.sort_index(ascending=True).values.astype(float)
+        close_price_arr = df_close_price.sort_index(ascending=True).values.astype(float)
+        vwap_arr = df_vwap.sort_index(ascending=True).values.astype(float)
+        amount_arr = df_amount.sort_index(ascending=True).values.astype(float)
+        print(f"[get_all_symbol_kline] 数据拼接完成，最终数据形状: {open_price_arr.shape}")
+        return all_symbol_list, time_arr, open_price_arr, high_price_arr, low_price_arr, close_price_arr, vwap_arr, amount_arr
+    
+    def weighted_spearmanr(self, y_true, y_pred):
+        n = len(y_true)
+        if n < 2:
+            return 0.0  # 样本量过小时返回0，避免计算错误
+        r_true = pd.Series(y_true).rank(ascending=False, method='average')
+        r_pred = pd.Series(y_pred).rank(ascending=False, method='average')
+        x = 2 * (r_true - 1) / (n - 1) - 1
+        w = x **2  
+        w_sum = w.sum()
+        if w_sum == 0:
+            return 0.0  # 避免权重和为0导致除零
+        mu_true = (w * r_true).sum() / w_sum
+        mu_pred = (w * r_pred).sum() / w_sum
+        cov = (w * (r_true - mu_true) * (r_pred - mu_pred)).sum()
+        var_true = (w * (r_true - mu_true)** 2).sum()
+        var_pred = (w * (r_pred - mu_pred) **2).sum()
+        if var_true == 0 or var_pred == 0:
+            return 0.0  # 避免方差为0导致除零
+        return cov / np.sqrt(var_true * var_pred)
+
+    def train(self, df_target, df_factor1, df_factor2, df_factor3, df_factor4, batch_results=None, save_result=False):
+        t0 = time.time()
+        scaler = StandardScaler()
+        factor1_long = df_factor1.stack()
+        factor2_long = df_factor2.stack()
+        factor3_long = df_factor3.stack()
+        factor4_long = df_factor4.stack()
+        target_long = df_target.stack()
+        factor1_long.name = 'factor1'
+        factor2_long.name = 'factor2'
+        factor3_long.name = 'factor3'
+        factor4_long.name = 'factor4'
+        target_long.name = 'target'
+        data = pd.concat([factor1_long, factor2_long, factor3_long, factor4_long, target_long], axis=1).dropna()
+        if data.empty:
+            return None
+        X = data[['factor1', 'factor2', 'factor3', 'factor4']]
+        y = data['target']
+        
+        # 添加时间序列交叉验证，解决数据泄露问题
+        print(f"[train] 开始时间序列交叉验证，数据量: {len(X)}")
+        tscv = TimeSeriesSplit(n_splits=2)  # 使用2次分割，平衡时间和效果
+        best_score = -np.inf
+        best_model = None
+        
+        for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
+            # 按时间顺序分割数据，确保只用过去数据预测未来
+            X_train = X.iloc[train_idx]
+            X_val = X.iloc[val_idx]
+            y_train = y.iloc[train_idx]
+            y_val = y.iloc[val_idx]
+            
+            print(f"[train] 第{fold+1}次交叉验证 - 训练集: {len(X_train)}, 验证集: {len(X_val)}")
+            
+            # 训练模型
+            model_temp = xgb.XGBRegressor(
+                n_estimators=50,  # 减少树的数量，加快训练
+                max_depth=2,      # 减少深度，避免过拟合
+                learning_rate=0.2,
+                subsample=0.6,
+                colsample_bytree=0.6,
+                random_state=42,
+                n_jobs=1
+            )
+            model_temp.fit(X_train, y_train)
+            
+            # 预测验证集
+            y_pred_val = model_temp.predict(X_val)
+            
+            # 计算验证集分数 - 修复索引问题
+            score = self.weighted_spearmanr(y_val.values, y_pred_val)
+            print(f"[train] 第{fold+1}次验证分数: {score:.4f}")
+            
+            # 保存最佳模型
+            if score > best_score:
+                best_score = score
+                best_model = model_temp
+        
+        print(f"[train] 最佳验证分数: {best_score:.4f}")
+        
+        # 实现三阶段预测方案
+        if best_model is not None:
+            # 按时间顺序排列数据
+            data_sorted = data.sort_index(level=0)
+            X_sorted = data_sorted[['factor1', 'factor2', 'factor3', 'factor4']]
+            y_sorted = data_sorted['target']
+            
+            total_samples = len(X_sorted)
+            print(f"[train] 开始三阶段预测，总数据量: {total_samples}")
+            
+            all_predictions = []
+            
+            # 第一阶段：滑动窗口预测0%-20%（步长=10 + 线性回归）
+            stage1_end = int(total_samples * 0.20)
+            step_size = 10  # 每10个时间点更新一次模型
+            
+            print(f"[train] 第一阶段：滑动窗口预测0-{stage1_end}，步长={step_size}")
+            print(f"[train] 第一阶段需要训练的模型数量: {(stage1_end - 3) // step_size}")
+            
+            # 滑动窗口：从第4个时间点开始，逐步预测到20%
+            stage1_models_trained = 0
+            for i in range(3, stage1_end, step_size):
+                # 使用从开始到当前时间点的所有数据训练
+                X_train_window = X_sorted.iloc[:i]
+                y_train_window = y_sorted.iloc[:i]
+                
+                # 使用线性回归，训练速度极快
+                window_model = LinearRegression()
+                window_model.fit(X_train_window, y_train_window)
+                
+                # 预测接下来的step_size个时间点
+                end_idx = min(i + step_size, stage1_end)
+                X_predict_batch = X_sorted.iloc[i:end_idx]
+                y_true_batch = y_sorted.iloc[i:end_idx]
+                
+                if len(X_predict_batch) > 0:
+                    y_pred_batch = window_model.predict(X_predict_batch)
+                    
+                    # 保存预测结果
+                    batch_predictions = pd.DataFrame({
+                        'target': y_true_batch.values,
+                        'y_pred': y_pred_batch
+                    }, index=y_true_batch.index)
+                    all_predictions.append(batch_predictions)
+                
+                stage1_models_trained += 1
+                if stage1_models_trained % 50 == 0:
+                    print(f"[train] 第一阶段进度: {stage1_models_trained}/{(stage1_end - 3) // step_size}")
+            
+            print(f"[train] 第一阶段完成，训练了{stage1_models_trained}个模型")
+            
+            # 第二阶段：用前20%预测20%-50%
+            stage2_end = int(total_samples * 0.50)
+            print(f"[train] 第二阶段：固定训练集预测{stage1_end}-{stage2_end}")
+            
+            X_train_stage2 = X_sorted.iloc[:stage1_end]
+            y_train_stage2 = y_sorted.iloc[:stage1_end]
+            
+            print(f"[train] 第二阶段训练数据量: {len(X_train_stage2)}")
+            model_stage2 = xgb.XGBRegressor(
+                n_estimators=50, max_depth=2, learning_rate=0.2,
+                subsample=0.6, colsample_bytree=0.6, random_state=42, n_jobs=1
+            )
+            model_stage2.fit(X_train_stage2, y_train_stage2)
+            print(f"[train] 第二阶段模型训练完成")
+            
+            X_predict_stage2 = X_sorted.iloc[stage1_end:stage2_end]
+            y_true_stage2 = y_sorted.iloc[stage1_end:stage2_end]
+            
+            if len(X_predict_stage2) > 0:
+                y_pred_stage2 = model_stage2.predict(X_predict_stage2)
+                
+                stage2_predictions = pd.DataFrame({
+                    'target': y_true_stage2.values,
+                    'y_pred': y_pred_stage2
+                }, index=y_true_stage2.index)
+                all_predictions.append(stage2_predictions)
+                print(f"[train] 第二阶段预测完成，预测数据量: {len(stage2_predictions)}")
+            
+            # 第三阶段：用前50%预测50%-100%
+            print(f"[train] 第三阶段：固定训练集预测{stage2_end}-{total_samples}")
+            
+            X_train_stage3 = X_sorted.iloc[:stage2_end]
+            y_train_stage3 = y_sorted.iloc[:stage2_end]
+            
+            print(f"[train] 第三阶段训练数据量: {len(X_train_stage3)}")
+            model_stage3 = xgb.XGBRegressor(
+                n_estimators=50, max_depth=2, learning_rate=0.2,
+                subsample=0.6, colsample_bytree=0.6, random_state=42, n_jobs=1
+            )
+            model_stage3.fit(X_train_stage3, y_train_stage3)
+            print(f"[train] 第三阶段模型训练完成")
+            
+            X_predict_stage3 = X_sorted.iloc[stage2_end:]
+            y_true_stage3 = y_sorted.iloc[stage2_end:]
+            
+            if len(X_predict_stage3) > 0:
+                y_pred_stage3 = model_stage3.predict(X_predict_stage3)
+                
+                stage3_predictions = pd.DataFrame({
+                    'target': y_true_stage3.values,
+                    'y_pred': y_pred_stage3
+                }, index=y_true_stage3.index)
+                all_predictions.append(stage3_predictions)
+                print(f"[train] 第三阶段预测完成，预测数据量: {len(stage3_predictions)}")
+            
+            # 合并所有预测结果
+            if all_predictions:
+                all_pred_data = pd.concat(all_predictions, axis=0)
+                
+                # 计算整体样本外分数
+                rho_out_of_sample = self.weighted_spearmanr(all_pred_data['target'].values, all_pred_data['y_pred'].values)
+                print(f"三阶段预测样本外加权Spearman相关系数: {rho_out_of_sample:.4f}")
+                print(f"总预测数据量: {len(all_pred_data)}/{total_samples} ({len(all_pred_data)/total_samples*100:.1f}%)")
+                
+                # 保存样本外预测结果
+                self.all_train_data.append(all_pred_data)
+                
+                # 生成提交数据
+                df_submit = all_pred_data.reset_index()
+                df_submit = df_submit.rename(columns={'level_0': 'datetime', 'level_1': 'symbol'})
+                df_submit = df_submit[['datetime', 'symbol', 'y_pred']]
+                df_submit['datetime'] = pd.to_datetime(df_submit['datetime'])
+                df_submit["id"] = df_submit["datetime"].astype(str) + "_" + df_submit["symbol"]
+                df_submit = df_submit[['id', 'y_pred']].rename(columns={'y_pred': 'predict_return'})
+                print(f"[train] 生成提交数据，形状: {df_submit.shape}")
+                if batch_results is not None:
+                    batch_results.append(df_submit)
+                if save_result:
+                    try:
+                        df_submission_id = pd.read_csv(self.submission_id_path)
+                        id_list = df_submission_id["id"].tolist()
+                        df_submit_competion = df_submit[df_submit['id'].isin(id_list)].copy()
+                        missing_elements = list(set(id_list) - set(df_submit_competion['id']))
+                        new_rows = pd.DataFrame({'id': missing_elements, 'predict_return': [0] * len(missing_elements)})
+                        df_submit_competion = pd.concat([df_submit_competion, new_rows], ignore_index=True)
+                        df_submit_competion = df_submit_competion.set_index('id').loc[id_list].reset_index()
+                        df_submit_competion.to_csv("submission.csv", index=False)
+                        print("[train] Submit file saved as 'submission.csv'.")
+                    except Exception as e:
+                        print(f"Error saving submit file: {e}")
+                return df_submit
+            else:
+                print("[train] 没有生成预测结果")
+                return None
+        else:
+            print("[train] 没有可用的模型")
+            return None
+
+    def run(self):
+        print("="*50)
+        print("[run] 程序开始运行...")
+        print("="*50)
+        print("[run] 开始读取K线数据...")
+        (all_symbol_list, time_arr, open_price_arr, high_price_arr, low_price_arr, 
+         close_price_arr, vwap_arr, amount_arr) = self.get_all_symbol_kline()
+        if not all_symbol_list:
+            print("[run] No data loaded. Exiting run().")
+            return
+        print(f"[run] 数据加载完成，币种数量: {len(all_symbol_list)}")
+        print(f"[run] 时间范围: {pd.to_datetime(time_arr[0])} 到 {pd.to_datetime(time_arr[-1])}")
+        
+        df_vwap = pd.DataFrame(vwap_arr, columns=all_symbol_list, index=time_arr)
+        df_amount = pd.DataFrame(amount_arr, columns=all_symbol_list, index=time_arr)
+        df_close = pd.DataFrame(close_price_arr, columns=all_symbol_list, index=time_arr)
+        print(f"[run] 数据框创建完成，形状: {df_vwap.shape}")
+        print("[run] 数据加载完毕，开始训练...")
+        
+        windows_1d = 4 * 24 * 1
+        windows_7d = 4 * 24 * 7
+        batch_size = 10
+        time_index = pd.to_datetime(df_vwap.index)
+        months = sorted(set([(d.year, d.month) for d in time_index]))
+        print(f"[run] 时间范围: {len(months)}个月，从{months[0]}到{months[-1]}")
+        
+        batch_results = []
+        total_batches = len(all_symbol_list) // batch_size + (1 if len(all_symbol_list) % batch_size > 0 else 0)
+        print(f"[run] 总批次数: {total_batches}")
+        
+        for i in range(0, len(all_symbol_list), batch_size):
+            batch_symbols = all_symbol_list[i:i+batch_size]
+            current_batch = i//batch_size + 1
+            print(f"[run] 开始处理批次: {current_batch}/{total_batches}, 币种: {batch_symbols}")
+            df_vwap_batch = df_vwap[batch_symbols]
+            df_amount_batch = df_amount[batch_symbols]
+            df_close_batch = df_close[batch_symbols]
+            
+            month_count = 0
+            for year, month in months:
+                mask = (time_index.year == year) & (time_index.month == month)
+                if not mask.any():
+                    continue
+                month_count += 1
+                print(f"[run] 批次{current_batch} - 处理{year}年{month}月数据")
+                df_vwap_month = df_vwap_batch.loc[mask]
+                df_amount_month = df_amount_batch.loc[mask]
+                df_close_month = df_close_batch.loc[mask]
+                # BTC市场风向标：BTCUSDT的7天收益率
+                btc_7d_return = df_close['BTCUSDT'].loc[mask] / df_close['BTCUSDT'].loc[mask].shift(windows_7d) - 1
+                df_btc_7d_return = pd.DataFrame(
+                    np.tile(btc_7d_return.values[:, None], (1, len(batch_symbols))),
+                    index=btc_7d_return.index,
+                    columns=batch_symbols
+                )
+                print(f"[run] BTC市场因子统计: 均值={df_btc_7d_return.mean().mean():.4e}, 方差={df_btc_7d_return.var().mean():.4e}")
+                df_24hour_rtn = df_vwap_month / df_vwap_month.shift(windows_1d) - 1
+                df_15min_rtn = df_vwap_month / df_vwap_month.shift(1) - 1
+                df_7d_volatility = df_15min_rtn.rolling(windows_7d).std(ddof=1)
+                df_7d_momentum = df_vwap_month / df_vwap_month.shift(windows_7d) - 1
+                df_amount_sum = df_amount_month.rolling(windows_7d).sum()
+                print(f"[run] 开始训练模型...")
+                self.train(
+                    df_target=df_24hour_rtn.shift(-windows_1d),
+                    df_factor1=df_7d_volatility,
+                    df_factor2=df_7d_momentum,
+                    df_factor3=df_amount_sum,
+                    df_factor4=df_btc_7d_return,
+                    batch_results=batch_results,
+                    save_result=False
+                )
+            print(f"[run] 批次{current_batch}完成，处理了{month_count}个月的数据")
+        
+        print(f"[run] 所有批次处理完成，开始生成最终提交文件...")
+        if batch_results:
+            df_submit_all = pd.concat(batch_results, ignore_index=True)
+            df_submit_all = df_submit_all.drop_duplicates(subset=['id'], keep='last')
+            print(f"[run] Total predictions: {len(df_submit_all)}")
+            df_submission_id = pd.read_csv(self.submission_id_path)
+            id_list = df_submission_id["id"].tolist()
+            df_submit_competion = df_submit_all[df_submit_all['id'].isin(id_list)].copy()
+            missing_elements = list(set(id_list) - set(df_submit_competion['id']))
+            new_rows = pd.DataFrame({'id': missing_elements, 'predict_return': [0] * len(missing_elements)})
+            df_submit_competion = pd.concat([df_submit_competion, new_rows], ignore_index=True)
+            df_submit_competion = df_submit_competion.set_index('id').loc[id_list].reset_index()
+            print(f"[run] Final submission shape: {df_submit_competion.shape} (expected: {len(id_list)})")
+            df_submit_competion.to_csv("submission.csv", index=False)
+            print("[run] Submit file saved as 'submission.csv'.")
+        else:
+            print("[run] No batch results generated.")
+        if self.all_train_data:
+            all_data = pd.concat(self.all_train_data, ignore_index=True)
+            rho_overall = self.weighted_spearmanr(all_data['target'].values, all_data['y_pred'].values)
+            print(f"Weighted Spearman correlation coefficient: {rho_overall:.4f}")
+        
+        print("="*50)
+        print("[run] 程序运行完成！")
+        print("="*50)
+
+
+if __name__ == '__main__':
+    model = OlsModel()
+    model.run()
